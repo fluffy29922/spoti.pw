@@ -1,20 +1,16 @@
-name: Build IPA from your own Spotify IPA
+name: Build IPA from kit
 
 on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct link to a decrypted Spotify IPA"
+        description: "Direct link to a decrypted Spotify IPA (9.1.78)"
         required: true
         type: string
-      upload_method:
-        description: "Where to put the result"
-        default: artifacts
-        type: choice
-        options: [artifacts, filebin, both]
-
-env:
-  THEOS: ${{ github.workspace }}/theos
+      kit_url:
+        description: "Direct link to spoti.pw-0.50.0-kit.zip"
+        required: true
+        type: string
 
 jobs:
   build:
@@ -24,43 +20,67 @@ jobs:
 
       - uses: levibostian/action-hide-sensitive-inputs@v1
 
-      - uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      - uses: actions/checkout@v5
-        with:
-          repository: theos/theos
-          path: theos
-          submodules: recursive
-
       - name: Install tools
         run: |
-          brew install make dpkg ldid
+          brew install ldid
           python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
-      - name: Download IPA
+      - name: Download
         run: |
-          mkdir -p ipa
+          mkdir -p ipa out
           curl -fsSL "${{ inputs.ipa_url }}" -o ipa/spotify.ipa
-          case "$(file --mime-type -b ipa/spotify.ipa)" in application/zip|application/x-ios-app) ;; *) echo "::error::Not an IPA"; exit 1 ;; esac
+          curl -fsSL "${{ inputs.kit_url }}" -o kit.zip
+          unzip -q kit.zip -d kit
 
-      - run: make release
+      - name: Build
+        run: |
+          set -euo pipefail
+          IN=ipa/spotify.ipa
+          OUT="$PWD/out/spoti.ipa"
+          APP="$(unzip -Z1 "$IN" | grep -oE '^Payload/[^/]+\.app/' | sort -u | head -1)"
+          unzip -p "$IN" "${APP}Info.plist" > host.plist
+          echo "Spotify $(plutil -extract CFBundleShortVersionString raw -o - host.plist)"
+
+          A=kit/files/PlugIns/SpotifyGlassLiveActivity.appex
+          rm -rf "$A/_CodeSignature"
+          sed -e "s/HOST_BUNDLE_ID/$(plutil -extract CFBundleIdentifier raw -o - host.plist)/" \
+              -e "s/HOST_SHORT_VERSION/$(plutil -extract CFBundleShortVersionString raw -o - host.plist)/" \
+              -e "s/HOST_VERSION/$(plutil -extract CFBundleVersion raw -o - host.plist)/" \
+              "$A/Info.plist" > info.tmp
+          mv info.tmp "$A/Info.plist"
+          plutil -convert binary1 "$A/Info.plist"
+
+          cat > kit.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          <key>UIDesignRequiresCompatibility</key><false/>
+          <key>NSSupportsLiveActivities</key><true/>
+          <key>NSSupportsLiveActivitiesFrequentUpdates</key><true/>
+          <key>MusicHapticsSupported</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          cyan -i "$IN" -o "$OUT" \
+            -f kit/files/Frameworks/spotifyglass.dylib kit/files/Frameworks/SpotifyGlassAppGroups.dylib "$A" \
+            -l kit.plist -w -s --overwrite
+
+          W="${APP}PlugIns/WidgetExtension.appex/WidgetExtension"
+          if unzip -l "$OUT" "$W" >/dev/null 2>&1; then
+            P="$(mktemp -d)"
+            unzip -q "$OUT" "$W" -d "$P"
+            python3 scripts/insert-dylib.py "$P/$W" @rpath/SpotifyGlassAppGroups.dylib
+            ldid -e "$P/$W" > "$P/ents.plist"
+            ldid -S"$P/ents.plist" "$P/$W"
+            (cd "$P" && zip -q "$OUT" "$W")
+          fi
+
+          python3 scripts/merge-appintents.py "$OUT" "$APP" kit/appintents
 
       - uses: actions/upload-artifact@v5
-        if: inputs.upload_method != 'filebin'
         with:
           name: spoti.ipa
           path: out/*.ipa
           if-no-files-found: error
-
-      - name: Upload to filebin.net
-        if: inputs.upload_method != 'artifacts'
-        run: |
-          BIN="spotifyglass-${{ github.run_id }}"
-          echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
-          for f in out/*.ipa; do
-            curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@$f" "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
-            echo "- https://filebin.net/$BIN/$(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
-          done
-          echo "- _filebin deletes bins after a few days of inactivity, download promptly._" >> "$GITHUB_STEP_SUMMARY"
